@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.env
+.env.*
+!.env.example
+tokens
+*.jpg
+*.png
+.DS_Store
+.deployed-revision
+.deployed-at

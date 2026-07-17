@@ -62,6 +62,48 @@ python chatgpt.py --once --proxy "http://127.0.0.1:7890"
 | `TIGER_SMS_POLL_SECONDS` | 收码超时秒数，默认 `120` |
 | `TIGER_SMS_NUMBER_RETRIES` | 换号次数，默认 `3` |
 
+## 小站 Docker 部署（自动更新）
+
+路径：`/home/ubuntu/codexsignup`  
+镜像：`codexsignup:latest`  
+触发：`push main` → GitHub Actions `deploy-small` → SSH 执行 `deploy/deploy.sh`
+
+### 服务器 bootstrap（一次性）
+
+```bash
+# 小站
+cd ~
+git clone https://github.com/ZHJay/codexsignup.git codexsignup
+cd codexsignup
+cp .env.example .env
+# 编辑 .env：OEP_* / TIGER_SMS_* / OEP_ADMIN_PASSWORD
+# 同机 Docker 建议：
+#   OEP_BASE_URL=http://outlook-email-plus:5000
+chmod 600 .env
+mkdir -p tokens && chmod 700 tokens
+bash deploy/deploy.sh
+```
+
+### 手动跑一轮
+
+```bash
+cd ~/codexsignup
+sudo docker compose --profile tools run --rm codexsignup --once
+# 可选代理
+sudo docker compose --profile tools run --rm -e PROXY=http://host:port codexsignup --once --proxy http://host:port
+```
+
+### GitHub Secrets（仓库 ZHJay/codexsignup）
+
+| Secret | 值 |
+|--------|-----|
+| `SMALL_HOST` | 小站 IP |
+| `SMALL_USER` | `ubuntu` |
+| `SMALL_SSH_KEY` | 部署私钥全文 |
+| `SMALL_DEPLOY_PATH` | `/home/ubuntu/codexsignup` |
+
+之后每次 `git push origin main` 自动 `fetch + reset --hard + compose build`。
+
 ## 产出文件
 
 注册成功后写入 `tokens/`：

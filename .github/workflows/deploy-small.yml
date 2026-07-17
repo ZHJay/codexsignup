@@ -1,0 +1,46 @@
+# 小站自动部署：push 到 main 后 SSH 执行 deploy/deploy.sh，重建 Docker 镜像。
+# Secrets: SMALL_HOST / SMALL_USER / SMALL_SSH_KEY / SMALL_DEPLOY_PATH(可选，默认 $HOME/codexsignup)
+
+name: deploy-small
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-small-codexsignup
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SMALL_HOST }}
+          username: ${{ secrets.SMALL_USER }}
+          key: ${{ secrets.SMALL_SSH_KEY }}
+          port: 22
+          script_stop: true
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+            DEPLOY_PATH="${{ secrets.SMALL_DEPLOY_PATH }}"
+            if [ -z "${DEPLOY_PATH}" ]; then
+              DEPLOY_PATH="$HOME/codexsignup"
+            fi
+            echo "[ci] deploy path=$DEPLOY_PATH"
+            if [ ! -d "$DEPLOY_PATH/.git" ]; then
+              echo "[ci] ERROR: $DEPLOY_PATH 不是 git 仓库。请先 bootstrap。"
+              exit 1
+            fi
+            if [ ! -f "$DEPLOY_PATH/.env" ]; then
+              echo "[ci] ERROR: 缺少 $DEPLOY_PATH/.env"
+              exit 1
+            fi
+            cd "$DEPLOY_PATH"
+            bash deploy/deploy.sh
+            echo "[ci] deployed=$(cat .deployed-revision 2>/dev/null || true)"

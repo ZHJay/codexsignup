@@ -4,3 +4,5 @@ __pycache__/
 tokens/
 *.pyc
 .DS_Store
+.deployed-revision
+.deployed-at

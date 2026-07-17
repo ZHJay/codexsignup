@@ -1,0 +1,29 @@
+# Layer: L2 流程层（部署编排）
+# Contract: 构建 codexsignup 镜像；.env 与 tokens 挂载在宿主机，不进 Git。
+# Boundary: 批处理工具，默认不常驻；用 `docker compose run` 执行任务。
+# Why: 接入同机 outlook-email-plus_default，容器内直连 OEP:5000。
+
+services:
+  codexsignup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codexsignup:latest
+    container_name: codexsignup
+    env_file:
+      - .env
+    environment:
+      PROXY: ${PROXY:-}
+    networks:
+      - default
+      - oep
+    volumes:
+      - ./tokens:/app/tokens
+    restart: "no"
+    profiles:
+      - tools
+
+networks:
+  oep:
+    external: true
+    name: outlook-email-plus_default
