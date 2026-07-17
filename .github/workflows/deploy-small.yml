@@ -42,5 +42,9 @@ jobs:
               exit 1
             fi
             cd "$DEPLOY_PATH"
+            git remote get-url origin >/dev/null
+            git fetch --prune origin
+            git checkout main
+            git reset --hard origin/main
             bash deploy/deploy.sh
             echo "[ci] deployed=$(cat .deployed-revision 2>/dev/null || true)"
