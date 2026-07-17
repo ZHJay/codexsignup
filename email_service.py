@@ -136,7 +136,7 @@ class EmailService:
         return f"{self.base_url}{path}"
 
     def _ensure_admin_session(self) -> requests.Session | None:
-        """POST /login 建立管理端 cookie 会话。"""
+        """POST /login + CSRF，建立管理端 cookie 会话。"""
         if not self.admin_password:
             return None
         if self._admin_session is not None:
@@ -155,11 +155,20 @@ class EmailService:
             if not payload.get("success"):
                 print(f"[-] OEP 管理端登录失败: {payload.get('message') or res.status_code}")
                 return None
+            # Why: batch-update-group 等写接口要 X-CSRFToken，否则报「会话已失效」。
+            csrf_res = session.get(self._url("/api/csrf-token"), timeout=20)
+            csrf_payload = csrf_res.json() if csrf_res.content else {}
+            token = csrf_payload.get("csrf_token")
+            if token:
+                session.headers["X-CSRFToken"] = str(token)
             self._admin_session = session
             return session
         except Exception as exc:
             print(f"[-] OEP 管理端登录异常: {exc}")
             return None
+
+    def _invalidate_admin_session(self) -> None:
+        self._admin_session = None
 
     def _resolve_group_id(self, group_name: str) -> int | None:
         name = (group_name or "").strip()
@@ -187,7 +196,7 @@ class EmailService:
             return None
 
     def move_account_to_group(self, account_id: int | str, group_name: str) -> bool:
-        """POST /api/accounts/batch-update-group（管理端）。
+        """POST /api/accounts/batch-update-group（管理端 + CSRF）。
 
         Contract: 需要 OEP_ADMIN_PASSWORD；目标组不能是系统组。
         """
@@ -200,23 +209,43 @@ class EmailService:
                 f"{' 或未配置 OEP_ADMIN_PASSWORD' if not self.admin_password else ''}"
             )
             return False
-        session = self._ensure_admin_session()
-        if session is None:
-            return False
-        try:
+
+        def _do_move(session: requests.Session) -> tuple[bool, str]:
             res = session.post(
                 self._url("/api/accounts/batch-update-group"),
                 json={"account_ids": [int(account_id)], "group_id": int(group_id)},
                 timeout=20,
             )
             payload = res.json() if res.content else {}
-            ok = bool(payload.get("success"))
+            if payload.get("success"):
+                return True, ""
+            msg = str(
+                (payload.get("error") or {}).get("message")
+                or payload.get("message")
+                or res.status_code
+            )
+            return False, msg
+
+        session = self._ensure_admin_session()
+        if session is None:
+            return False
+        try:
+            ok, msg = _do_move(session)
+            # CSRF/会话失效时重建一次
+            if not ok and any(
+                x in msg for x in ("CSRF", "会话", "session", "token", "登录")
+            ):
+                self._invalidate_admin_session()
+                session = self._ensure_admin_session()
+                if session is None:
+                    print(f"[-] 移动分组失败 account_id={account_id}: {msg}")
+                    return False
+                ok, msg = _do_move(session)
             if ok:
                 print(f"[*] 邮箱 account_id={account_id} → 分组「{group_name}」")
             else:
                 print(
-                    f"[-] 移动分组失败 account_id={account_id} group={group_name}: "
-                    f"{payload.get('message') or res.status_code}"
+                    f"[-] 移动分组失败 account_id={account_id} group={group_name}: {msg}"
                 )
             return ok
         except Exception as exc:
@@ -367,13 +396,8 @@ class EmailService:
     ) -> bool:
         """任务成功/终态：POST /api/external/pool/claim-complete。
 
-        Why: 成功默认移到 GPT success；provider_blocked 等失败态默认 Garbage。
+        Contract: 默认**不**移分组；调用方在整轮注册结束后显式传入 group_name。
         """
-        if group_name is None:
-            if result == "success":
-                group_name = self.group_success
-            else:
-                group_name = self.group_failure
         return self._finish(
             address,
             mode="complete",
@@ -383,10 +407,44 @@ class EmailService:
         )
 
     def delete_email(self, address: str, *, group_name: str | None = None) -> bool:
-        """中途放弃：POST /api/external/pool/claim-release，并移到失败分组。"""
-        if group_name is None:
-            group_name = self.group_failure
+        """中途放弃：POST /api/external/pool/claim-release。
+
+        Contract: 默认不移分组；需要时由调用方传入 group_name。
+        """
         return self._finish(address, mode="release", group_name=group_name)
+
+    def finalize_registration(
+        self,
+        address: str,
+        *,
+        outcome: str,
+        detail: str = "",
+    ) -> bool:
+        """整轮注册结束后的唯一收尾：池状态 + 分组移动。
+
+        outcome:
+          - success → claim-complete(success) + GPT success
+          - blocked → claim-complete(provider_blocked) + Garbage
+          - failure → claim-release + Garbage
+        """
+        if outcome == "success":
+            return self.complete_email(
+                address,
+                result="success",
+                detail=detail or "codex_registered",
+                group_name=self.group_success,
+            )
+        if outcome == "blocked":
+            return self.complete_email(
+                address,
+                result="provider_blocked",
+                detail=detail or "provider_blocked",
+                group_name=self.group_failure,
+            )
+        return self.delete_email(
+            address,
+            group_name=self.group_failure,
+        )
 
     def _finish(
         self,
@@ -429,7 +487,7 @@ class EmailService:
         except Exception:
             ok = False
 
-        # Boundary: 租约结束后再移分组；失败不阻断 complete/release 结果。
+        # Boundary: 仅当调用方显式要求时才移组（整轮结束后）。
         if group_name:
             try:
                 self.move_account_to_group(lease["account_id"], group_name)

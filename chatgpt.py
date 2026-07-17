@@ -224,19 +224,6 @@ def _page_type_from_resp(resp) -> str:
         data = {}
     return str((data.get("page") or {}).get("type") or "")
 
-def _retire_dirty_email(email_service: EmailService, email: str, page_type: str) -> bool:
-    """脏号 complete(provider_blocked) 冻结出池，避免 release 回 available 再踩。"""
-    try:
-        return bool(
-            email_service.complete_email(
-                email,
-                result="provider_blocked",
-                detail=f"not_signup_page:{page_type or 'empty'}",
-            )
-        )
-    except Exception:
-        return False
-
 def fetch_sentinel_token(*, flow: str, did: str, proxies: Any = None, session: Any = None) -> Optional[str]:
     """返回完整 openai-sentinel-token 头（含 PoW p 字段）。"""
     return build_sentinel_token(
@@ -314,7 +301,10 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
     # Boundary: 邮箱只走 OEP 池 claim/complete/release，不再创建 mail.tm 临时地址。
     email_service = EmailService()
     email = None
-    finished = False
+    # Why: 分组移动只在整轮结束后做一次；中途只记录 outcome。
+    # outcome: success | blocked | failure
+    finish_outcome: Optional[str] = None
+    finish_detail = ""
 
     print("[*] 初始化请求，从 Outlook Email Plus 领取邮箱...")
     try:
@@ -359,6 +349,8 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
         )
         if signup_resp.status_code != 200:
             print(f"[Error] 提交邮箱失败: {signup_resp.status_code} {_snip(signup_resp)}")
+            finish_outcome = "failure"
+            finish_detail = f"authorize_continue:{signup_resp.status_code}"
             return None
 
         page_type = _page_type_from_resp(signup_resp)
@@ -366,11 +358,12 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
 
         # Why: login_password 等页再调 register 必 invalid_auth_step 400。
         if page_type in _DIRTY_PAGE_TYPES or page_type not in _SIGNUP_PAGE_TYPES:
-            if _retire_dirty_email(email_service, email, page_type):
-                finished = True
+            # 整轮在此结束：finally 里 finalize blocked + 移 Garbage
+            finish_outcome = "blocked"
+            finish_detail = f"not_signup_page:{page_type or 'empty'}"
             print(
                 f"[Error] 邮箱不可注册: page={page_type or 'empty'} "
-                f"(已从池冻结/释放；换新邮箱重试)"
+                f"(将冻结并移到失败分组)"
             )
             return None
 
@@ -556,13 +549,9 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
                     redirect_uri=oauth.redirect_uri,
                     expected_state=oauth.state,
                 )
-                try:
-                    email_service.complete_email(
-                        email, result="success", detail="codex_registered"
-                    )
-                except Exception:
-                    pass
-                finished = True
+                # 整轮成功：finally 统一 finalize + 移 GPT success
+                finish_outcome = "success"
+                finish_detail = "codex_registered"
                 return token_json, email, password
 
             final_resp = s.get(current_url, allow_redirects=False, timeout=15)
@@ -572,18 +561,27 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
             current_url = urllib.parse.urljoin(current_url, location)
 
         print("[Error] 未能在重定向链中捕获到最终 Token")
+        finish_outcome = "failure"
+        finish_detail = "token_redirect_miss"
         return None
 
     except Exception as e:
         print(f"[Error] 运行时异常: {e}")
+        if finish_outcome is None:
+            finish_outcome = "failure"
+            finish_detail = f"exception:{e}"
         return None
     finally:
-        # 失败/中断：释放租约，避免邮箱卡在 claimed
-        if email and not finished:
+        # 整轮结束后才 complete/release + 移分组
+        if email:
+            outcome = finish_outcome or "failure"
+            detail = finish_detail or "registration_aborted"
             try:
-                email_service.delete_email(email)
-            except Exception:
-                pass
+                email_service.finalize_registration(
+                    email, outcome=outcome, detail=detail
+                )
+            except Exception as exc:
+                print(f"[-] 邮箱收尾失败: {exc}")
 
 
 # ========== 3. 主程序轮询与保存 ==========
