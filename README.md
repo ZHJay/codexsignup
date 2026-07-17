@@ -1,70 +1,78 @@
-# 🚀 OpenAI / ChatGPT 全自动注册机 & Token 提取器
+# OpenAI / ChatGPT 全自动注册机 & Token 提取器
 
-![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg)
-![curl_cffi](https://img.shields.io/badge/curl__cffi-Chrome%20120-success.svg)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+基于 `curl_cffi` 的 Codex OAuth 注册脚本：自动注册并提取 `access_token` / `refresh_token`。
 
-这是一个高度现代化的 OpenAI 自动化注册脚本。本项目不仅实现了全自动化的 ChatGPT 账号注册流程，还集成了对 OpenAI 最新反爬机制（Sentinel）的绕过方案，并能够通过拦截原生 OAuth2 授权流，直接为你提取出最核心的 `access_token` 和 `refresh_token`。
+## 邮箱后端
 
-## ✨ 核心特性
+**Outlook Email Plus** 邮箱池（`/api/external/*`），与 `gptsignup` 同源，不再使用 `mail.tm`。
 
-* 📧 **全自动邮箱对接**：内置 `mail.tm` 临时邮箱 API 接口，动态获取可用域名，自动轮询并提取验证码。
-* 🛡️ **无视 TLS 指纹检测**：底层全面采用 `curl_cffi`，完美伪装 Chrome 120 浏览器指纹，有效绕过 Cloudflare 盾和基础网络拦截。
-* 🔑 **突破 Sentinel 风控**：针对 OpenAI 最新的机器验证机制，在关键请求前自动向 `sentinel.openai.com` 申请并携带合规的防护 Token (`authorize_continue` & `oauth_create_account`)。
-* 🚀 **深度 Token 提取 (OAuth2 PKCE)**：自动生成状态码和挑战码 (Code Challenge)，模拟真实用户环境选择默认工作区 (Workspace)，并通过拦截底层的跳转重定向，强行提取出包括 `access_token` 和 `refresh_token` 在内的完整授权配置。
-* 📁 **结构化资产管理**：注册成功后，自动在本地创建 `tokens` 文件夹，将完整的 Token 信息保存为 JSON 文件，并将明文账密按 `账号----密码` 格式追加保存。
+| 步骤 | 接口 |
+|------|------|
+| 领取邮箱 | `POST /api/external/pool/claim-random` |
+| 取验证码 | `GET /api/external/verification-code` |
+| 成功回写 | `POST /api/external/pool/claim-complete` |
+| 失败释放 | `POST /api/external/pool/claim-release` |
 
-## 🛠️ 环境准备与安装
+前置条件：在 Outlook Email Plus 管理面板导入可用的 **Outlook/IMAP 账号** 到邮箱池（`provider=outlook` 或 `imap`），并开启对外 API + 邮箱池。
 
-1. **环境要求**：需要 Python 3.8 或更高版本。
-2. **克隆项目**：
-   ```bash
-   git clone https://github.com/你的用户名/你的项目名.git
-   cd 你的项目名
-   ```
-3. **安装依赖**：
-   本项目高度依赖 `curl_cffi` 库，请使用 pip 进行安装：
-   ```bash
-   pip install curl_cffi
-   ```
+## 手机验证（Tiger SMS v2）
 
-## 💻 使用说明
+OTP 后若出现 `add_phone`，自动：
 
-脚本提供了极其简单的命令行调用方式，支持无限循环注册和代理配置。
+1. `getNumberV2`（`service=dr`，`country=1001` 美国 VIP）取号  
+2. `POST /api/accounts/add-phone/send` 提交完整 E.164（如 `+1304…`；UI 虽只显示本地号，API 要带国家码）  
+3. `getStatusV2` 轮询短信码  
+4. `POST /api/accounts/phone-otp/validate` 校验  
+5. 成功 `setStatusV2 status=6`；超时/失败 `status=8` 取消，最多换号 3 次  
 
-### 1. 基础运行 (无限循环注册)
-脚本默认会一直循环运行，每次注册完成后随机休息 5-15 秒，适合挂机批量生成。
+| 步骤 | Tiger SMS |
+|------|-----------|
+| 取号 | `getNumberV2` |
+| 收码 | `getStatusV2` |
+| 完成 | `setStatusV2` (`6`) |
+| 取消 | `setStatusV2` (`8`) |
+
+## 快速开始
+
 ```bash
-python chatgpt.py
-```
-
-### 2. 单次运行测试 (`--once`)
-如果你只想测试注册一个账号，请带上 `--once` 参数：
-```bash
-python chatgpt.py --once
-```
-
-### 3. 配置本地代理 (`--proxy`)
-由于 OpenAI 对网络环境有严格要求，你可以直接通过命令行传入代理地址（支持 HTTP/HTTPS/SOCKS5）：
-```bash
-python chatgpt.py --proxy "http://127.0.0.1:7890"
-
-# 或搭配单次运行：
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # 填 OEP_* 与 TIGER_SMS_API_KEY
+python chatgpt.py                  # 循环注册
+python chatgpt.py --once           # 只跑一次
 python chatgpt.py --once --proxy "http://127.0.0.1:7890"
 ```
 
-## 📂 产出文件说明
+## 环境变量
 
-注册成功的账号数据会自动保存在脚本同级目录的 `tokens/` 文件夹下：
+| 变量 | 说明 |
+|------|------|
+| `OEP_BASE_URL` | Outlook Email Plus 根地址；本机可用 `http://127.0.0.1:5001`，公网 `https://outlook.api4kimi8.org` |
+| `OEP_API_KEY` | 对外 API Key（`X-API-Key`） |
+| `OEP_PROVIDER` | 池筛选，默认 `outlook`；勿用 `cloudflare_temp_mail` |
+| `OEP_PROJECT_KEY` | 项目隔离 key，默认 `codex_register` |
+| `OEP_CALLER_ID` | 调用方标识 |
+| `OEP_ADMIN_PASSWORD` | OEP **管理端登录密码**（移动分组用，不是 API Key） |
+| `OEP_GROUP_SUCCESS` | 注册成功移入的分组名，默认 `GPT success` |
+| `OEP_GROUP_FAILURE` | 注册失败移入的分组名，默认 `Garbage` |
+| `TIGER_SMS_API_KEY` | Tiger SMS API Key（必填，用于 add_phone） |
+| `TIGER_SMS_SERVICE` | 默认 `dr` |
+| `TIGER_SMS_COUNTRY` | 默认 `1001`（美国 VIP） |
+| `TIGER_SMS_MAX_PRICE` | 可选；不填则取 `getPricesV2.saleAveragePrice` |
+| `TIGER_SMS_POLL_SECONDS` | 收码超时秒数，默认 `120` |
+| `TIGER_SMS_NUMBER_RETRIES` | 换号次数，默认 `3` |
 
-* `accounts.txt`：汇总保存所有的账号密码，格式为 `email----password`，方便直接复制到第三方发卡平台或客户端使用。
-* `token_[email]_[timestamp].json`：详细的授权文件，包含您的 `access_token`、`refresh_token`、`id_token` 以及过期时间等底层通讯秘钥。
+## 产出文件
 
-## ⚠️ 免责声明 (Disclaimer)
+注册成功后写入 `tokens/`：
 
-1. 本项目代码仅供**编程学习与学术研究**（如探讨 OAuth2 授权机制、TLS 指纹安全及对抗技术）使用。
-2. 请勿将本项目用于任何非法用途、大规模恶意注册或违反平台服务条款（TOS）的商业行为。
-3. OpenAI 的接口风控策略经常变动，不保证代码的永久可用性。因使用本脚本带来的任何封号风险或法律纠纷，由使用者自行承担，与开发者无关。
+* `accounts.txt`：`email----password`
+* `token_[email]_[timestamp].json`：含 `access_token` / `refresh_token` / `id_token`
 
----
-*If you find this project helpful, please consider giving it a ⭐!*
+## 注意事项
+
+1. `.env` 永不提交；本机/服务器单独维护。
+2. 池空会报 `NO_AVAILABLE_ACCOUNT`：先在 OEP 管理面板导入账号。
+3. 失败路径会自动 `claim-release`，避免邮箱卡在 claimed。
+4. 注册成功 → 分组 `GPT success`；失败/脏号/中断 → 分组 `Garbage`（需配置 `OEP_ADMIN_PASSWORD`）。
+5. 仅供学习研究。
