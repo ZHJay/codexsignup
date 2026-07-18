@@ -80,6 +80,8 @@ xvfb-run -a python chatgpt.py --once --browser
 | `OEP_ADMIN_PASSWORD` | OEP **管理端登录密码**（移动分组用，不是 API Key） |
 | `OEP_GROUP_SUCCESS` | 注册成功移入的分组名，默认 `GPT success` |
 | `OEP_GROUP_FAILURE` | 注册失败移入的分组名，默认 `Garbage` |
+| `OEP_CLAIM_GROUP` | **仅从此分组领取**，默认 `默认分组` |
+| `OEP_CLAIM_GROUP_RETRIES` | 非目标组跳过重试次数，默认 `30` |
 | `TIGER_SMS_API_KEY` | Tiger SMS API Key（必填，用于 add_phone） |
 | `TIGER_SMS_SERVICE` | 默认 `dr` |
 | `TIGER_SMS_COUNTRY` | 默认 `1001`（美国 VIP） |

@@ -111,6 +111,15 @@ class EmailService:
         ).strip()
         self.group_success = (os.getenv("OEP_GROUP_SUCCESS") or "GPT success").strip()
         self.group_failure = (os.getenv("OEP_GROUP_FAILURE") or "Garbage").strip()
+        # Why: 对外 claim-random 不支持 group 筛选；客户端领取后校验，非目标组立即 release。
+        self.claim_group = (
+            os.getenv("OEP_CLAIM_GROUP")
+            or os.getenv("OEP_GROUP_CLAIM")
+            or "默认分组"
+        ).strip()
+        self.claim_group_retries = max(
+            1, int(os.getenv("OEP_CLAIM_GROUP_RETRIES") or "30")
+        )
 
         if not self.base_url:
             raise ValueError("Missing: OEP_BASE_URL (or MAIL_BASE_URL)")
@@ -252,49 +261,157 @@ class EmailService:
             print(f"[-] 移动分组异常: {exc}")
             return False
 
-    def create_email(self) -> tuple[str | None, str | None]:
-        """领取邮箱：POST /api/external/pool/claim-random。
+    def _account_group_name(self, account_id: int | str) -> str | None:
+        """管理端 GET /api/accounts/<id> 读取分组名。"""
+        session = self._ensure_admin_session()
+        if session is None:
+            return None
+        try:
+            res = session.get(self._url(f"/api/accounts/{int(account_id)}"), timeout=20)
+            payload = res.json() if res.content else {}
+            acc = payload.get("account") if isinstance(payload, dict) else None
+            if not isinstance(acc, dict):
+                # 有的版本直接铺平
+                acc = payload if isinstance(payload, dict) else {}
+            name = str(acc.get("group_name") or "").strip()
+            if name:
+                return name
+            gid = acc.get("group_id")
+            if gid is not None:
+                # 回查缓存
+                for gname, g in self._group_id_cache.items():
+                    if int(g) == int(gid):
+                        return gname
+                # 刷新分组表
+                self._resolve_group_id(self.claim_group)
+                for gname, g in self._group_id_cache.items():
+                    if int(g) == int(gid):
+                        return gname
+            return None
+        except Exception as exc:
+            print(f"[-] 查询账号分组失败 account_id={account_id}: {exc}")
+            return None
 
-        返回 (claim_token, email)，保持调用方解构兼容。
-        """
-        task_id = f"codex-{uuid.uuid4().hex[:16]}"
-        body: dict[str, Any] = {
-            "caller_id": self.caller_id,
-            "task_id": task_id,
-            "provider": self.provider,
-        }
-        if self.project_key:
-            body["project_key"] = self.project_key
+    def _release_lease_raw(
+        self,
+        *,
+        account_id: int | str,
+        claim_token: str,
+        caller_id: str,
+        task_id: str,
+        reason: str,
+    ) -> bool:
+        """仅 claim-release，不移分组。"""
         try:
             res = requests.post(
-                self._url("/api/external/pool/claim-random"),
+                self._url("/api/external/pool/claim-release"),
                 headers=self._headers,
-                json=body,
+                json={
+                    "account_id": int(account_id),
+                    "claim_token": claim_token,
+                    "caller_id": caller_id,
+                    "task_id": task_id,
+                    "reason": reason,
+                },
                 timeout=20,
             )
             payload = res.json() if res.content else {}
-            if not payload.get("success"):
-                print(
-                    f"[-] 领取邮箱失败: {payload.get('code')} - {payload.get('message')}"
-                )
-                return None, None
-            data = payload.get("data") or {}
-            email = data.get("email")
-            claim_token = data.get("claim_token")
-            account_id = data.get("account_id")
-            if not email or not claim_token or account_id is None:
-                print(f"[-] 领取邮箱失败: 响应缺字段 - {data}")
-                return None, None
-            self._leases[email] = {
-                "account_id": account_id,
-                "claim_token": claim_token,
+            return bool(payload.get("success"))
+        except Exception:
+            return False
+
+    def create_email(self) -> tuple[str | None, str | None]:
+        """领取邮箱：POST /api/external/pool/claim-random。
+
+        Contract: 仅接受 OEP_CLAIM_GROUP（默认「默认分组」）内账号。
+        Why: 对外池接口不支持按分组筛选；非目标组立即 release 回 available，不进 Garbage。
+        返回 (claim_token, email)，保持调用方解构兼容。
+        """
+        target = self.claim_group
+        # 预热分组缓存（可选）
+        if self.admin_password:
+            self._resolve_group_id(target)
+
+        for attempt in range(1, self.claim_group_retries + 1):
+            task_id = f"codex-{uuid.uuid4().hex[:16]}"
+            body: dict[str, Any] = {
                 "caller_id": self.caller_id,
                 "task_id": task_id,
+                "provider": self.provider,
             }
-            return claim_token, email
-        except Exception as exc:
-            print(f"[-] 领取邮箱失败: {exc}")
-            return None, None
+            if self.project_key:
+                body["project_key"] = self.project_key
+            try:
+                res = requests.post(
+                    self._url("/api/external/pool/claim-random"),
+                    headers=self._headers,
+                    json=body,
+                    timeout=20,
+                )
+                payload = res.json() if res.content else {}
+                if not payload.get("success"):
+                    print(
+                        f"[-] 领取邮箱失败: {payload.get('code')} - {payload.get('message')}"
+                    )
+                    return None, None
+                data = payload.get("data") or {}
+                email = data.get("email")
+                claim_token = data.get("claim_token")
+                account_id = data.get("account_id")
+                if not email or not claim_token or account_id is None:
+                    print(f"[-] 领取邮箱失败: 响应缺字段 - {data}")
+                    return None, None
+
+                # Boundary: 无管理密码则无法验分组，直接使用（并告警一次）。
+                if not self.admin_password:
+                    if attempt == 1:
+                        print(
+                            "[!] 未配置 OEP_ADMIN_PASSWORD，无法校验领取分组，"
+                            "将使用 claim-random 任意可用号"
+                        )
+                    self._leases[email] = {
+                        "account_id": account_id,
+                        "claim_token": claim_token,
+                        "caller_id": self.caller_id,
+                        "task_id": task_id,
+                    }
+                    return claim_token, email
+
+                group_name = self._account_group_name(account_id)
+                if group_name == target:
+                    print(
+                        f"[*] 领取邮箱来自「{group_name}」: {email} "
+                        f"(account_id={account_id})"
+                    )
+                    self._leases[email] = {
+                        "account_id": account_id,
+                        "claim_token": claim_token,
+                        "caller_id": self.caller_id,
+                        "task_id": task_id,
+                    }
+                    return claim_token, email
+
+                # 非目标组：释放回池，不移 Garbage
+                print(
+                    f"[!] 跳过非目标分组账号 email={email} "
+                    f"group={group_name or '?'} 需要={target} "
+                    f"({attempt}/{self.claim_group_retries})，release 回池"
+                )
+                self._release_lease_raw(
+                    account_id=account_id,
+                    claim_token=claim_token,
+                    caller_id=self.caller_id,
+                    task_id=task_id,
+                    reason=f"skip_non_claim_group:{group_name or 'unknown'}",
+                )
+            except Exception as exc:
+                print(f"[-] 领取邮箱失败: {exc}")
+                return None, None
+
+        print(
+            f"[-] 连续 {self.claim_group_retries} 次未领到「{target}」内可用邮箱"
+        )
+        return None, None
 
     def fetch_verification_code(self, email: str, max_attempts: int = 40) -> str | None:
         """优先 OEP verification-code；失败再读 messages 本地抽码。"""
