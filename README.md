@@ -41,7 +41,32 @@ cp .env.example .env   # 填 OEP_* 与 TIGER_SMS_API_KEY
 python chatgpt.py                  # 循环注册
 python chatgpt.py --once           # 只跑一次
 python chatgpt.py --once --proxy "http://127.0.0.1:7890"
+# 方案 C：真浏览器过 CF（VDS 被 challenge 时）
+playwright install chrome
+xvfb-run -a python chatgpt.py --once --browser   # 无桌面
+# python chatgpt.py --once --browser             # 有桌面/RDP
 ```
+
+## 方案 C：真浏览器过 Cloudflare
+
+当 `curl` 出现 `cf-mitigated: challenge` / `Just a moment` 时：
+
+```bash
+pip install -r requirements.txt
+playwright install chrome
+# Linux 无桌面
+sudo apt-get install -y xvfb
+xvfb-run -a python chatgpt.py --once --browser
+```
+
+流程：有头 Chrome 打开 OAuth → 等 CF 消失 → 页内 fetch 提交邮箱 → cookie 同步后续 API。
+
+| 参数/环境变量 | 说明 |
+|------|------|
+| `--browser` / `USE_BROWSER=1` | 启用浏览器过 CF |
+| `--browser-headless` / `BROWSER_HEADLESS=1` | 无头（通常更难过 CF） |
+| `BROWSER_CHANNEL` | 默认 `chrome`，可改 `chromium` |
+| `BROWSER_CF_TIMEOUT_MS` | 等 CF 超时毫秒，默认 `120000` |
 
 ## 环境变量
 
