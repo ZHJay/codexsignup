@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import json
 import random
+import re
 import time
 import uuid
 from typing import Any, Optional
@@ -15,12 +16,20 @@ from typing import Any, Optional
 from curl_cffi import requests
 
 SENTINEL_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
-USER_AGENT = (
+DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
-SEC_CH_UA = '"Chromium";v="120", "Google Chrome";v="120", "Not-A.Brand";v="99"'
+DEFAULT_SEC_CH_UA = (
+    '"Google Chrome";v="131", "Chromium";v="131", "Not A(Brand";v="24"'
+)
+
+
+def _sec_ch_ua_from_ua(ua: str) -> str:
+    m = re.search(r"Chrome/(\d+)", ua or "")
+    major = m.group(1) if m else "131"
+    return f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not A(Brand";v="24"'
 
 
 class SentinelTokenGenerator:
@@ -102,16 +111,20 @@ def build_sentinel_token(
     flow: str,
     proxies: Any = None,
     session: Any = None,
-    ua: str = USER_AGENT,
+    ua: str = DEFAULT_UA,
+    sec_ch_ua: str = "",
+    impersonate: str = "chrome131",
 ) -> Optional[str]:
     """返回 openai-sentinel-token 头字符串；失败返回 None。"""
+    ua = ua or DEFAULT_UA
+    sec = sec_ch_ua or _sec_ch_ua_from_ua(ua)
     gen = SentinelTokenGenerator(device_id, ua)
     headers = {
         "Content-Type": "text/plain;charset=UTF-8",
         "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
         "Origin": "https://sentinel.openai.com",
         "User-Agent": ua,
-        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua": sec,
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
     }
@@ -125,7 +138,7 @@ def build_sentinel_token(
                 data=body,
                 headers=headers,
                 proxies=proxies,
-                impersonate="chrome120",
+                impersonate=impersonate or "chrome131",
                 timeout=20,
             )
         data = resp.json() if getattr(resp, "text", None) else {}

@@ -18,7 +18,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY chatgpt.py email_service.py phone_service.py phone_flow.py sentinel.py ./
+COPY chatgpt.py email_service.py phone_service.py phone_flow.py sentinel.py http_session.py ./
 
 RUN mkdir -p /app/tokens \
     && useradd --create-home --uid 10001 appuser \

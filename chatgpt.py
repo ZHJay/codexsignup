@@ -21,13 +21,19 @@ from curl_cffi import requests
 from curl_cffi.requests import Session
 
 from email_service import EmailService
+from http_session import (
+    is_cloudflare_challenge,
+    pick_impersonate,
+    sec_ch_ua_for_impersonate,
+    ua_for_impersonate,
+)
 from phone_flow import handle_add_phone
 from sentinel import build_sentinel_token
 
-# 配置输出目录和请求UA
+# 配置输出目录；UA 随 impersonate 动态对齐，不再写死 chrome120
 OUT_DIR = Path(__file__).parent.resolve()
 AUTH_BASE = "https://auth.openai.com"
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+UA = ua_for_impersonate("chrome131")
 
 # ========== 1. OpenAI OAuth2 授权与环境生成模块 ==========
 
@@ -258,14 +264,23 @@ def _discard_http_session(session) -> None:
         pass
 
 
-def fetch_sentinel_token(*, flow: str, did: str, proxies: Any = None, session: Any = None) -> Optional[str]:
+def fetch_sentinel_token(
+    *,
+    flow: str,
+    did: str,
+    proxies: Any = None,
+    session: Any = None,
+    ua: str = "",
+    sec_ch_ua: str = "",
+) -> Optional[str]:
     """返回完整 openai-sentinel-token 头（含 PoW p 字段）。"""
     return build_sentinel_token(
         device_id=did,
         flow=flow,
         proxies=proxies,
         session=session,
-        ua=UA,
+        ua=ua or UA,
+        sec_ch_ua=sec_ch_ua or "",
     )
 
 
@@ -330,6 +345,12 @@ def submit_callback_url(
 def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = None
+    # Why: 指纹须与 UA/sec-ch-ua 同步；过旧 chrome120 易吃 CF challenge。
+    impersonate = pick_impersonate(proxy or "")
+    global UA
+    UA = ua_for_impersonate(impersonate)
+    sec_ch_ua = sec_ch_ua_for_impersonate(impersonate)
+    print(f"[*] TLS impersonate={impersonate}")
 
     # Boundary: 邮箱只走 OEP 池 claim/complete/release，不再创建 mail.tm 临时地址。
     email_service = EmailService()
@@ -358,7 +379,7 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
         max_oauth_tries = 2
         for oauth_try in range(1, max_oauth_tries + 1):
             _discard_http_session(s)
-            s = requests.Session(proxies=proxies, impersonate="chrome120")
+            s = requests.Session(proxies=proxies, impersonate=impersonate)
             s.headers.update({"user-agent": UA})
 
             oauth = generate_oauth_url(email=email)
@@ -373,6 +394,16 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
                 timeout=30,
                 allow_redirects=True,
             )
+            if is_cloudflare_challenge(resp):
+                print(
+                    "[Error] OAuth 入口被 Cloudflare 挑战拦截 "
+                    f"(impersonate={impersonate})。请换干净代理后重试。"
+                )
+                finish_outcome = "failure"
+                finish_detail = f"oauth_cf_challenge:{impersonate}"
+                _discard_http_session(s)
+                s = None
+                return None
             if int(getattr(resp, "status_code", 0) or 0) >= 400:
                 print(
                     f"[Error] OAuth 入口失败: {resp.status_code} {_snip(resp)}"
@@ -388,7 +419,12 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
             print(f"[*] device_id={did}")
 
             sentinel = fetch_sentinel_token(
-                flow="authorize_continue", did=did, proxies=proxies, session=s
+                flow="authorize_continue",
+                did=did,
+                proxies=proxies,
+                session=s,
+                ua=UA,
+                sec_ch_ua=sec_ch_ua,
             )
             signup_headers = _json_headers(f"{AUTH_BASE}/create-account", did)
             if sentinel:
@@ -472,6 +508,8 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
                         did=did,
                         proxies=proxies,
                         session=s,
+                        ua=UA,
+                        sec_ch_ua=sec_ch_ua,
                     )
                     or ""
                 )
@@ -515,7 +553,12 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
         if code_resp.status_code != 200:
             validate_headers["openai-sentinel-token"] = (
                 fetch_sentinel_token(
-                    flow="authorize_continue", did=did, proxies=proxies, session=s
+                    flow="authorize_continue",
+                    did=did,
+                    proxies=proxies,
+                    session=s,
+                    ua=UA,
+                    sec_ch_ua=sec_ch_ua,
                 )
                 or ""
             )
@@ -549,7 +592,7 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
         if page_type == "add_phone":
             # Why: Codex 路径常见 add_phone；接 Tiger SMS 自动过手机验证。
             next_page = handle_add_phone(
-                s, device_id=did, proxies=proxies
+                s, device_id=did, proxies=proxies, ua=UA, sec_ch_ua=sec_ch_ua
             )
             if not next_page:
                 print("[Error] 手机验证失败（取号/收码/校验均未通过）")
@@ -571,7 +614,12 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
 
             create_headers = _json_headers(f"{AUTH_BASE}/about-you", did)
             create_sentinel = fetch_sentinel_token(
-                flow="oauth_create_account", did=did, proxies=proxies, session=s
+                flow="oauth_create_account",
+                did=did,
+                proxies=proxies,
+                session=s,
+                ua=UA,
+                sec_ch_ua=sec_ch_ua,
             )
             if create_sentinel:
                 create_headers["openai-sentinel-token"] = create_sentinel

@@ -60,7 +60,8 @@ python chatgpt.py --once --proxy "http://127.0.0.1:7890"
 | `TIGER_SMS_COUNTRY` | 默认 `1001`（美国 VIP） |
 | `TIGER_SMS_MAX_PRICE` | 可选；不填则取 `getPricesV2.saleAveragePrice` |
 | `TIGER_SMS_POLL_SECONDS` | 收码超时秒数，默认 `120` |
-| `TIGER_SMS_NUMBER_RETRIES` | 换号次数，默认 `3` |
+| `TIGER_SMS_NUMBER_RETRIES` | 换号次数，默认 3 |
+| `IMPERSONATE` | 可选，强制 TLS 指纹（如 `chrome146`）；默认自动探测 |
 
 ## 小站 Docker 部署（自动更新）
 

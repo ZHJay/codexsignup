@@ -13,10 +13,10 @@ from phone_service import PhoneService, TigerSmsError
 from sentinel import build_sentinel_token
 
 AUTH_BASE = "https://auth.openai.com"
-UA = (
+DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 
@@ -27,25 +27,15 @@ def _snip(resp, n: int = 280) -> str:
         return ""
 
 
-def _json_headers(referer: str, device_id: str) -> dict[str, str]:
+def _json_headers(referer: str, device_id: str, ua: str = DEFAULT_UA) -> dict[str, str]:
     return {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "origin": AUTH_BASE,
-        "referer": referer,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": ua or DEFAULT_UA,
+        "Referer": referer,
+        "Origin": AUTH_BASE,
         "oai-device-id": device_id,
-        "user-agent": UA,
     }
-
-
-def _nav_headers(referer: str = "") -> dict[str, str]:
-    headers = {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "user-agent": UA,
-    }
-    if referer:
-        headers["referer"] = referer
-    return headers
 
 
 def _sentinel(
@@ -53,6 +43,8 @@ def _sentinel(
     device_id: str,
     proxies: Any = None,
     session: Any = None,
+    ua: str = DEFAULT_UA,
+    sec_ch_ua: str = "",
 ) -> str:
     return (
         build_sentinel_token(
@@ -60,7 +52,8 @@ def _sentinel(
             flow="authorize_continue",
             proxies=proxies,
             session=session,
-            ua=UA,
+            ua=ua or DEFAULT_UA,
+            sec_ch_ua=sec_ch_ua or "",
         )
         or ""
     )
@@ -72,6 +65,8 @@ def openai_phone_send(
     device_id: str,
     phone_e164: str,
     proxies: Any = None,
+    ua: str = DEFAULT_UA,
+    sec_ch_ua: str = "",
 ) -> tuple[bool, str, dict]:
     """POST /api/accounts/add-phone/send。
 
@@ -80,7 +75,7 @@ def openai_phone_send(
     form value 仍是 react-phone-number-input 的 E.164；只传 10 位会
     invalid_phone_number。
     """
-    headers = _json_headers(f"{AUTH_BASE}/add-phone", device_id)
+    headers = _json_headers(f"{AUTH_BASE}/add-phone", device_id, ua=ua)
     # 只走 add-phone/send；phone-otp/send 不接受 phone_number（已绑号后重发）
     body_variants = (
         {"phone_number": phone_e164, "channel": "sms"},
@@ -98,7 +93,11 @@ def openai_phone_send(
         )
         if resp.status_code != 200:
             headers["openai-sentinel-token"] = _sentinel(
-                device_id=device_id, proxies=proxies, session=session
+                device_id=device_id,
+                proxies=proxies,
+                session=session,
+                ua=ua,
+                sec_ch_ua=sec_ch_ua,
             )
             resp = session.post(
                 f"{AUTH_BASE}/api/accounts/add-phone/send",
@@ -127,9 +126,11 @@ def openai_phone_validate(
     device_id: str,
     code: str,
     proxies: Any = None,
+    ua: str = DEFAULT_UA,
+    sec_ch_ua: str = "",
 ) -> tuple[bool, str, dict]:
     """POST /api/accounts/phone-otp/validate。"""
-    headers = _json_headers(f"{AUTH_BASE}/phone-verification", device_id)
+    headers = _json_headers(f"{AUTH_BASE}/phone-verification", device_id, ua=ua)
     body = json.dumps({"code": code})
     paths = (
         "/api/accounts/phone-otp/validate",
@@ -146,7 +147,11 @@ def openai_phone_validate(
         )
         if resp.status_code != 200:
             headers["openai-sentinel-token"] = _sentinel(
-                device_id=device_id, proxies=proxies, session=session
+                device_id=device_id,
+                proxies=proxies,
+                session=session,
+                ua=ua,
+                sec_ch_ua=sec_ch_ua,
             )
             resp = session.post(
                 f"{AUTH_BASE}{path}",
@@ -166,7 +171,10 @@ def openai_phone_validate(
                 try:
                     session.get(
                         continue_url,
-                        headers=_nav_headers(f"{AUTH_BASE}/phone-verification"),
+                        headers={
+                            "User-Agent": ua or DEFAULT_UA,
+                            "Referer": f"{AUTH_BASE}/phone-verification",
+                        },
                         timeout=15,
                         allow_redirects=True,
                     )
@@ -182,6 +190,8 @@ def handle_add_phone(
     *,
     device_id: str,
     proxies: Any = None,
+    ua: str = DEFAULT_UA,
+    sec_ch_ua: str = "",
     max_number_attempts: int = 3,
     code_wait_seconds: int = 120,
 ) -> Optional[str]:
@@ -221,33 +231,36 @@ def handle_add_phone(
             continue
 
         try:
-            ok, page_after_send, _raw = openai_phone_send(
+            ok, page, _data = openai_phone_send(
                 session,
                 device_id=device_id,
                 phone_e164=phone_e164,
                 proxies=proxies,
+                ua=ua,
+                sec_ch_ua=sec_ch_ua,
             )
             if not ok:
                 print("[Error] OpenAI 提交手机号失败，取消该号")
                 phone_svc.cancel(activation.activation_id)
                 continue
-            print(f"[*] 已提交手机号 page={page_after_send or '?'}")
 
-            print(f"[*] 等待短信验证码 (≤{wait_s}s)...")
+            print(f"[*] 已请求短信 page={page or '?'}")
             code = phone_svc.wait_code(
                 activation.activation_id, max_wait_seconds=wait_s
             )
             if not code:
-                print("[Error] 短信验证码超时，取消该号")
+                print("[Error] 超时未收到短信验证码，取消该号")
                 phone_svc.cancel(activation.activation_id)
                 continue
-            print(f"[*] 收到短信验证码: {code}")
 
-            ok, page_after, _raw = openai_phone_validate(
+            print(f"[*] 收到短信验证码: {code}")
+            ok, page, _data = openai_phone_validate(
                 session,
                 device_id=device_id,
                 code=code,
                 proxies=proxies,
+                ua=ua,
+                sec_ch_ua=sec_ch_ua,
             )
             if not ok:
                 print("[Error] 手机验证码校验失败，取消该号")
@@ -255,14 +268,15 @@ def handle_add_phone(
                 continue
 
             phone_svc.complete(activation.activation_id)
-            print(f"[*] 手机验证通过 page={page_after or '?'}")
-            return page_after or "about_you"
+            print(f"[*] 手机验证通过 page={page or '?'}")
+            return page or "about_you"
         except Exception as exc:
-            print(f"[Error] 手机验证流程异常: {exc}")
+            print(f"[Error] 手机验证异常: {exc}")
             if activation is not None:
                 try:
                     phone_svc.cancel(activation.activation_id)
                 except Exception:
                     pass
 
+    print("[Error] 手机验证多次失败")
     return None
