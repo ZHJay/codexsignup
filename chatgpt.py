@@ -224,6 +224,40 @@ def _page_type_from_resp(resp) -> str:
         data = {}
     return str((data.get("page") or {}).get("type") or "")
 
+
+def _is_invalid_state_resp(resp) -> bool:
+    """OpenAI 登录会话作废：409 或 error.code=invalid_state。"""
+    status = int(getattr(resp, "status_code", 0) or 0)
+    try:
+        data = resp.json() or {}
+    except Exception:
+        data = {}
+    err = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        err = {}
+    code = str(err.get("code") or "").strip().lower()
+    msg = str(err.get("message") or "").lower()
+    if code == "invalid_state":
+        return True
+    if status == 409 and ("no longer valid" in msg or "start over" in msg):
+        return True
+    return status == 409 and code in ("", "invalid_state")
+
+
+def _discard_http_session(session) -> None:
+    """丢弃废 OAuth 会话，避免 cookie/state 污染下一轮。"""
+    if session is None:
+        return
+    try:
+        session.cookies.clear()
+    except Exception:
+        pass
+    try:
+        session.close()
+    except Exception:
+        pass
+
+
 def fetch_sentinel_token(*, flow: str, did: str, proxies: Any = None, session: Any = None) -> Optional[str]:
     """返回完整 openai-sentinel-token 头（含 PoW p 字段）。"""
     return build_sentinel_token(
@@ -295,8 +329,7 @@ def submit_callback_url(
 
 def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    s = requests.Session(proxies=proxies, impersonate="chrome120")
-    s.headers.update({"user-agent": UA})
+    s = None
 
     # Boundary: 邮箱只走 OEP 池 claim/complete/release，不再创建 mail.tm 临时地址。
     email_service = EmailService()
@@ -317,48 +350,103 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
         print(f"[*] 成功获取邮箱: {email}")
         print(f"[*] 生成高强度密码: {password}")
 
-        # 原路径：Codex CLI OAuth 注册并提取 token
-        oauth = generate_oauth_url(email=email)
-        print("[*] 使用 Codex client 注册...")
+        # Why: invalid_state 会话必须整段丢弃；同一 cookie 上重试 continue 只会再 409。
+        # 同一邮箱最多开 2 次全新 OAuth；仍 409 则本轮邮箱收尾，下一轮 run() 全新开始。
+        oauth = None
+        did = ""
+        page_type = ""
+        max_oauth_tries = 2
+        for oauth_try in range(1, max_oauth_tries + 1):
+            _discard_http_session(s)
+            s = requests.Session(proxies=proxies, impersonate="chrome120")
+            s.headers.update({"user-agent": UA})
 
-        # 第一步：进入 OAuth
-        resp = s.get(
-            oauth.auth_url,
-            headers=_nav_headers("https://chatgpt.com/"),
-            timeout=30,
-            allow_redirects=True,
-        )
-        did = str(s.cookies.get("oai-did") or "").strip() or str(uuid.uuid4())
-        _set_device_cookie(s, did)
-        print(f"[*] device_id={did}")
+            oauth = generate_oauth_url(email=email)
+            print(
+                f"[*] 使用 Codex client 注册... "
+                f"(OAuth 会话 {oauth_try}/{max_oauth_tries})"
+            )
 
-        # 第二步：authorize_continue
-        sentinel = fetch_sentinel_token(
-            flow="authorize_continue", did=did, proxies=proxies, session=s
-        )
-        signup_headers = _json_headers(f"{AUTH_BASE}/create-account", did)
-        if sentinel:
-            signup_headers["openai-sentinel-token"] = sentinel
-        signup_resp = s.post(
-            f"{AUTH_BASE}/api/accounts/authorize/continue",
-            headers=signup_headers,
-            data=json.dumps(
-                {"username": {"value": email, "kind": "email"}, "screen_hint": "signup"}
-            ),
-            timeout=30,
-        )
-        if signup_resp.status_code != 200:
-            print(f"[Error] 提交邮箱失败: {signup_resp.status_code} {_snip(signup_resp)}")
+            resp = s.get(
+                oauth.auth_url,
+                headers=_nav_headers("https://chatgpt.com/"),
+                timeout=30,
+                allow_redirects=True,
+            )
+            if int(getattr(resp, "status_code", 0) or 0) >= 400:
+                print(
+                    f"[Error] OAuth 入口失败: {resp.status_code} {_snip(resp)}"
+                )
+                finish_outcome = "failure"
+                finish_detail = f"oauth_authorize:{resp.status_code}"
+                _discard_http_session(s)
+                s = None
+                return None
+
+            did = str(s.cookies.get("oai-did") or "").strip() or str(uuid.uuid4())
+            _set_device_cookie(s, did)
+            print(f"[*] device_id={did}")
+
+            sentinel = fetch_sentinel_token(
+                flow="authorize_continue", did=did, proxies=proxies, session=s
+            )
+            signup_headers = _json_headers(f"{AUTH_BASE}/create-account", did)
+            if sentinel:
+                signup_headers["openai-sentinel-token"] = sentinel
+            signup_resp = s.post(
+                f"{AUTH_BASE}/api/accounts/authorize/continue",
+                headers=signup_headers,
+                data=json.dumps(
+                    {
+                        "username": {"value": email, "kind": "email"},
+                        "screen_hint": "signup",
+                    }
+                ),
+                timeout=30,
+            )
+
+            if signup_resp.status_code == 200:
+                page_type = _page_type_from_resp(signup_resp)
+                print(f"[*] authorize/continue page={page_type or '?'}")
+                break
+
+            if _is_invalid_state_resp(signup_resp):
+                print(
+                    f"[!] invalid_state/409：本轮 OAuth 会话已废 "
+                    f"({oauth_try}/{max_oauth_tries}) {_snip(signup_resp)}"
+                )
+                _discard_http_session(s)
+                s = None
+                oauth = None
+                if oauth_try < max_oauth_tries:
+                    print("[*] 已清除废会话，用全新 OAuth 重开（同一邮箱）...")
+                    time.sleep(1)
+                    continue
+                print("[Error] 连续 invalid_state，放弃本轮邮箱并收尾")
+                finish_outcome = "failure"
+                finish_detail = "authorize_continue:invalid_state"
+                return None
+
+            print(
+                f"[Error] 提交邮箱失败: {signup_resp.status_code} {_snip(signup_resp)}"
+            )
             finish_outcome = "failure"
             finish_detail = f"authorize_continue:{signup_resp.status_code}"
+            _discard_http_session(s)
+            s = None
+            return None
+        else:
+            finish_outcome = "failure"
+            finish_detail = "oauth_exhausted"
             return None
 
-        page_type = _page_type_from_resp(signup_resp)
-        print(f"[*] authorize/continue page={page_type or '?'}")
+        if s is None or oauth is None:
+            finish_outcome = "failure"
+            finish_detail = "oauth_session_missing"
+            return None
 
         # Why: login_password 等页再调 register 必 invalid_auth_step 400。
         if page_type in _DIRTY_PAGE_TYPES or page_type not in _SIGNUP_PAGE_TYPES:
-            # 整轮在此结束：finally 里 finalize blocked + 移 Garbage
             finish_outcome = "blocked"
             finish_detail = f"not_signup_page:{page_type or 'empty'}"
             print(
@@ -582,6 +670,8 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
                 )
             except Exception as exc:
                 print(f"[-] 邮箱收尾失败: {exc}")
+        # Invariant: 无论成败都丢掉 HTTP 会话，下一轮 run() 不得复用废 cookie。
+        _discard_http_session(s)
 
 
 # ========== 3. 主程序轮询与保存 ==========
@@ -623,12 +713,13 @@ def main():
 
         else:
             print("[-] 本次注册流程断开。")
+            print("[*] 已丢弃本轮会话；下一轮将重新领邮箱并开全新 OAuth。")
 
         if args.once:
             break
 
         wait_time = random.randint(5, 15)
-        print(f"[*] 冷却 {wait_time} 秒...")
+        print(f"[*] 冷却 {wait_time} 秒后开始下一轮...")
         time.sleep(wait_time)
 
 if __name__ == "__main__":
