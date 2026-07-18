@@ -35,6 +35,17 @@ try:
 except Exception:  # pragma: no cover
     BrowserCfSession = None  # type: ignore
 
+try:
+    from browser_password import (
+        page_looks_like_password,
+        register_via_page_fetch,
+        submit_password_on_page,
+    )
+except Exception:  # pragma: no cover
+    page_looks_like_password = None  # type: ignore
+    register_via_page_fetch = None  # type: ignore
+    submit_password_on_page = None  # type: ignore
+
 # 配置输出目录；UA 随 impersonate 动态对齐，不再写死 chrome120
 OUT_DIR = Path(__file__).parent.resolve()
 AUTH_BASE = "https://auth.openai.com"
@@ -501,6 +512,25 @@ def run(
                 "screen_hint": "signup",
             }
 
+            # Why: login_hint 过 CF 后常已在 password 页；再 continue 可能污染会话。
+            if (
+                use_browser
+                and browser is not None
+                and page_looks_like_password is not None
+            ):
+                try:
+                    burl = str(browser.page.url or "")
+                    btitle = browser.page.title() or ""
+                except Exception:
+                    burl, btitle = "", ""
+                if page_looks_like_password(burl, btitle):
+                    print(
+                        "[*] 浏览器已在密码页，跳过 authorize/continue "
+                        f"url={burl}"
+                    )
+                    page_type = "create_account_password"
+                    break
+
             # Why: CF 后关键请求优先走浏览器页内 fetch，避免 cookie/TLS 指纹不一致。
             if use_browser and browser is not None:
                 st, data, raw = browser.page_fetch_json(
@@ -584,79 +614,59 @@ def run(
             reg_resp = None
 
             # Why: CF 通过后关键写接口优先留在浏览器 TLS/cookie 上下文。
-            if use_browser and browser is not None:
-                # 1) 页面已在密码页时直接填表（最稳）
-                try:
-                    page = browser.page
-                    cur = str(page.url or "")
-                    if "password" in cur or "create-account" in cur:
-                        print("[*] browser 在密码页，尝试 DOM 填密...")
-                        pwd = page.locator('input[type="password"]').first
-                        pwd.wait_for(state="visible", timeout=8000)
-                        pwd.fill(password)
-                        # 提交
-                        submitted = False
-                        for sel in (
-                            'button[type="submit"]',
-                            'button:has-text("Continue")',
-                            'button:has-text("继续")',
-                            'button:has-text("Next")',
-                        ):
-                            loc = page.locator(sel)
-                            if loc.count() > 0:
-                                loc.first.click(timeout=5000)
-                                submitted = True
-                                break
-                        if not submitted:
-                            page.keyboard.press("Enter")
-                        page.wait_for_timeout(2500)
-                        new_url = str(page.url or "")
-                        title = ""
-                        try:
-                            title = page.title() or ""
-                        except Exception:
-                            title = ""
-                        print(f"[*] browser 填密后 url={new_url} title={title!r}")
-                        # 若离开密码页或出现 OTP 相关，视为成功
-                        if (
-                            "email-verification" in new_url
-                            or "email-otp" in new_url
-                            or "otp" in new_url.lower()
-                            or "verify" in new_url.lower()
-                            or "about-you" in new_url
-                            or "add-phone" in new_url
-                            or "password" not in new_url
-                        ):
-                            reg_resp = _SimpleResp(
-                                200,
-                                {"page": {"type": "email_otp_verification"}},
-                                "",
-                            )
-                except Exception as exc:
-                    print(f"[!] browser DOM 填密失败，改走页内 API: {exc}")
-
-                # 2) 页内 fetch register
-                if reg_resp is None or getattr(reg_resp, "status_code", 0) != 200:
-                    sentinel = fetch_sentinel_token(
-                        flow="username_password_create",
-                        did=did,
-                        proxies=proxies,
-                        session=s,
-                        ua=UA,
-                        sec_ch_ua=sec_ch_ua,
-                    )
-                    if sentinel:
-                        register_headers["openai-sentinel-token"] = sentinel
-                    st, data, raw = browser.page_fetch_json(
-                        url=f"{AUTH_BASE}/api/accounts/user/register",
-                        method="POST",
-                        headers=register_headers,
-                        body=reg_body_obj,
-                    )
-                    reg_resp = _SimpleResp(
-                        st, data if isinstance(data, dict) else {}, raw
-                    )
+            if use_browser and browser is not None and submit_password_on_page is not None:
+                ok, st, raw, final_url = submit_password_on_page(
+                    browser.page, password=password, email=email
+                )
+                if ok:
+                    reg_resp = _SimpleResp(200, {"page": {"type": "email_otp_verification"}}, raw)
                     browser.apply_cookies_to_curl_session(s)
+                else:
+                    print(f"[!] DOM 设密未完成 status={st} note={raw[:200]} url={final_url}")
+                    # 页内 fetch 多 body 回退
+                    if register_via_page_fetch is not None:
+                        sentinel = fetch_sentinel_token(
+                            flow="username_password_create",
+                            did=did,
+                            proxies=proxies,
+                            session=s,
+                            ua=UA,
+                            sec_ch_ua=sec_ch_ua,
+                        )
+                        if sentinel:
+                            register_headers["openai-sentinel-token"] = sentinel
+                        st2, data2, raw2 = register_via_page_fetch(
+                            browser.page,
+                            email=email,
+                            password=password,
+                            headers=register_headers,
+                        )
+                        reg_resp = _SimpleResp(
+                            st2, data2 if isinstance(data2, dict) else {}, raw2
+                        )
+                        browser.apply_cookies_to_curl_session(s)
+                    else:
+                        reg_resp = _SimpleResp(st or 400, {}, raw)
+            elif use_browser and browser is not None:
+                # 旧路径：页内 fetch
+                sentinel = fetch_sentinel_token(
+                    flow="username_password_create",
+                    did=did,
+                    proxies=proxies,
+                    session=s,
+                    ua=UA,
+                    sec_ch_ua=sec_ch_ua,
+                )
+                if sentinel:
+                    register_headers["openai-sentinel-token"] = sentinel
+                st, data, raw = browser.page_fetch_json(
+                    url=f"{AUTH_BASE}/api/accounts/user/register",
+                    method="POST",
+                    headers=register_headers,
+                    body=reg_body_obj,
+                )
+                reg_resp = _SimpleResp(st, data if isinstance(data, dict) else {}, raw)
+                browser.apply_cookies_to_curl_session(s)
             else:
                 reg_resp = s.post(
                     f"{AUTH_BASE}/api/accounts/user/register",
@@ -683,12 +693,11 @@ def run(
                         timeout=30,
                     )
 
-            if reg_resp.status_code != 200:
-                print(
-                    f"[Error] 设置密码失败: {reg_resp.status_code} {_snip(reg_resp)}"
-                )
+            if reg_resp is None or reg_resp.status_code != 200:
+                code = getattr(reg_resp, "status_code", 0) if reg_resp else 0
+                print(f"[Error] 设置密码失败: {code} {_snip(reg_resp) if reg_resp else ''}")
                 finish_outcome = "failure"
-                finish_detail = f"register:{reg_resp.status_code}"
+                finish_detail = f"register:{code}"
                 return None
             print("[*] password set")
 
