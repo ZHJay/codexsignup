@@ -30,6 +30,11 @@ from http_session import (
 from phone_flow import handle_add_phone
 from sentinel import build_sentinel_token
 
+try:
+    from browser_cf import BrowserCfSession
+except Exception:  # pragma: no cover
+    BrowserCfSession = None  # type: ignore
+
 # 配置输出目录；UA 随 impersonate 动态对齐，不再写死 chrome120
 OUT_DIR = Path(__file__).parent.resolve()
 AUTH_BASE = "https://auth.openai.com"
@@ -231,6 +236,18 @@ def _page_type_from_resp(resp) -> str:
     return str((data.get("page") or {}).get("type") or "")
 
 
+class _SimpleResp:
+    """把浏览器页内 fetch 结果适配成与 curl 响应相近的对象。"""
+
+    def __init__(self, status_code: int, data: Any, text: str = "") -> None:
+        self.status_code = int(status_code or 0)
+        self._data = data if isinstance(data, dict) else {}
+        self.text = text or ""
+
+    def json(self) -> dict:
+        return self._data
+
+
 def _is_invalid_state_resp(resp) -> bool:
     """OpenAI 登录会话作废：409 或 error.code=invalid_state。"""
     status = int(getattr(resp, "status_code", 0) or 0)
@@ -342,15 +359,24 @@ def submit_callback_url(
 
 # ========== 2. 核心注册与提取流程 ==========
 
-def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
+def run(
+    proxy: Optional[str],
+    *,
+    use_browser: bool = False,
+    browser_headless: bool = False,
+) -> Optional[tuple[str, str, str]]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = None
+    browser: Any = None
     # Why: 指纹须与 UA/sec-ch-ua 同步；过旧 chrome120 易吃 CF challenge。
+    # 浏览器模式下 UA 以真实 Chrome 为准，impersonate 仅作 curl 回退。
     impersonate = pick_impersonate(proxy or "")
     global UA
     UA = ua_for_impersonate(impersonate)
     sec_ch_ua = sec_ch_ua_for_impersonate(impersonate)
     print(f"[*] TLS impersonate={impersonate}")
+    if use_browser:
+        print(f"[*] browser CF 模式 headless={browser_headless}")
 
     # Boundary: 邮箱只走 OEP 池 claim/complete/release，不再创建 mail.tm 临时地址。
     email_service = EmailService()
@@ -379,6 +405,13 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
         max_oauth_tries = 2
         for oauth_try in range(1, max_oauth_tries + 1):
             _discard_http_session(s)
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                browser = None
+
             s = requests.Session(proxies=proxies, impersonate=impersonate)
             s.headers.update({"user-agent": UA})
 
@@ -388,35 +421,68 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
                 f"(OAuth 会话 {oauth_try}/{max_oauth_tries})"
             )
 
-            resp = s.get(
-                oauth.auth_url,
-                headers=_nav_headers("https://chatgpt.com/"),
-                timeout=30,
-                allow_redirects=True,
-            )
-            if is_cloudflare_challenge(resp):
-                print(
-                    "[Error] OAuth 入口被 Cloudflare 挑战拦截 "
-                    f"(impersonate={impersonate})。请换干净代理后重试。"
+            if use_browser:
+                if BrowserCfSession is None:
+                    print("[Error] 未安装 playwright，无法使用 --browser")
+                    finish_outcome = "failure"
+                    finish_detail = "playwright_missing"
+                    return None
+                try:
+                    browser = BrowserCfSession(
+                        proxy=proxy or "",
+                        headless=browser_headless,
+                    )
+                    boot = browser.open_and_wait_cf_clear(oauth.auth_url)
+                    if boot.user_agent:
+                        UA = boot.user_agent
+                        s.headers.update({"user-agent": UA})
+                    browser.apply_cookies_to_curl_session(s)
+                    did = (
+                        boot.oai_did
+                        or str(s.cookies.get("oai-did") or "").strip()
+                        or str(uuid.uuid4())
+                    )
+                    _set_device_cookie(s, did)
+                    print(f"[*] device_id={did} (browser)")
+                    print(f"[*] browser url={boot.final_url}")
+                except Exception as exc:
+                    print(f"[Error] 浏览器过 CF 失败: {exc}")
+                    finish_outcome = "failure"
+                    finish_detail = f"browser_cf:{exc}"
+                    _discard_http_session(s)
+                    s = None
+                    return None
+            else:
+                resp = s.get(
+                    oauth.auth_url,
+                    headers=_nav_headers("https://chatgpt.com/"),
+                    timeout=30,
+                    allow_redirects=True,
                 )
-                finish_outcome = "failure"
-                finish_detail = f"oauth_cf_challenge:{impersonate}"
-                _discard_http_session(s)
-                s = None
-                return None
-            if int(getattr(resp, "status_code", 0) or 0) >= 400:
-                print(
-                    f"[Error] OAuth 入口失败: {resp.status_code} {_snip(resp)}"
-                )
-                finish_outcome = "failure"
-                finish_detail = f"oauth_authorize:{resp.status_code}"
-                _discard_http_session(s)
-                s = None
-                return None
+                if is_cloudflare_challenge(resp):
+                    print(
+                        "[Error] OAuth 入口被 Cloudflare 挑战拦截 "
+                        f"(impersonate={impersonate})。"
+                        " 可加 --browser 用真浏览器过 CF，或换干净代理。"
+                    )
+                    finish_outcome = "failure"
+                    finish_detail = f"oauth_cf_challenge:{impersonate}"
+                    _discard_http_session(s)
+                    s = None
+                    return None
+                if int(getattr(resp, "status_code", 0) or 0) >= 400:
+                    print(
+                        f"[Error] OAuth 入口失败: {resp.status_code} {_snip(resp)}"
+                    )
+                    finish_outcome = "failure"
+                    finish_detail = f"oauth_authorize:{resp.status_code}"
+                    _discard_http_session(s)
+                    s = None
+                    return None
 
-            did = str(s.cookies.get("oai-did") or "").strip() or str(uuid.uuid4())
-            _set_device_cookie(s, did)
-            print(f"[*] device_id={did}")
+                did = str(s.cookies.get("oai-did") or "").strip() or str(uuid.uuid4())
+                _set_device_cookie(s, did)
+                print(f"[*] device_id={did}")
 
             sentinel = fetch_sentinel_token(
                 flow="authorize_continue",
@@ -429,17 +495,29 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
             signup_headers = _json_headers(f"{AUTH_BASE}/create-account", did)
             if sentinel:
                 signup_headers["openai-sentinel-token"] = sentinel
-            signup_resp = s.post(
-                f"{AUTH_BASE}/api/accounts/authorize/continue",
-                headers=signup_headers,
-                data=json.dumps(
-                    {
-                        "username": {"value": email, "kind": "email"},
-                        "screen_hint": "signup",
-                    }
-                ),
-                timeout=30,
-            )
+            signup_body = {
+                "username": {"value": email, "kind": "email"},
+                "screen_hint": "signup",
+            }
+
+            # Why: CF 后关键请求优先走浏览器页内 fetch，避免 cookie/TLS 指纹不一致。
+            if use_browser and browser is not None:
+                st, data, raw = browser.page_fetch_json(
+                    url=f"{AUTH_BASE}/api/accounts/authorize/continue",
+                    method="POST",
+                    headers=signup_headers,
+                    body=signup_body,
+                )
+                signup_resp = _SimpleResp(st, data if isinstance(data, dict) else {}, raw)
+                # 同步 cookie 回 curl session，供后续步骤
+                browser.apply_cookies_to_curl_session(s)
+            else:
+                signup_resp = s.post(
+                    f"{AUTH_BASE}/api/accounts/authorize/continue",
+                    headers=signup_headers,
+                    data=json.dumps(signup_body),
+                    timeout=30,
+                )
 
             if signup_resp.status_code == 200:
                 page_type = _page_type_from_resp(signup_resp)
@@ -454,6 +532,12 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
                 _discard_http_session(s)
                 s = None
                 oauth = None
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser = None
                 if oauth_try < max_oauth_tries:
                     print("[*] 已清除废会话，用全新 OAuth 重开（同一邮箱）...")
                     time.sleep(1)
@@ -720,6 +804,11 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
                 print(f"[-] 邮箱收尾失败: {exc}")
         # Invariant: 无论成败都丢掉 HTTP 会话，下一轮 run() 不得复用废 cookie。
         _discard_http_session(s)
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 # ========== 3. 主程序轮询与保存 ==========
@@ -728,11 +817,29 @@ def main():
     parser = argparse.ArgumentParser(description="OpenAI Codex 自动注册脚本 (Outlook Email Plus)")
     parser.add_argument("--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890")
     parser.add_argument("--once", action="store_true", help="只运行一次")
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="有头浏览器过 Cloudflare 后再自动化（方案 C）",
+    )
+    parser.add_argument(
+        "--browser-headless",
+        action="store_true",
+        help="浏览器无头模式（过 CF 能力通常弱于有头）",
+    )
     args = parser.parse_args()
+
+    use_browser = bool(args.browser or os.getenv("USE_BROWSER", "").strip() in ("1", "true", "yes"))
+    browser_headless = bool(
+        args.browser_headless
+        or os.getenv("BROWSER_HEADLESS", "").strip() in ("1", "true", "yes")
+    )
 
     count = 0
     print("========================================")
     print("OpenAI Codex 注册机 (OEP 邮箱池 + Token 提取)")
+    if use_browser:
+        print(f"模式: 真浏览器过 CF (headless={browser_headless})")
     print("========================================")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -740,7 +847,11 @@ def main():
     while True:
         count += 1
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 开始第 {count} 次注册流程 <<<")
-        run_result = run(args.proxy)
+        run_result = run(
+            args.proxy,
+            use_browser=use_browser,
+            browser_headless=browser_headless,
+        )
 
         if run_result:
             token_json, email, password = run_result
